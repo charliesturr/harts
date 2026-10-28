@@ -13,10 +13,17 @@ const GRAVITY = 220;     // how much dropping down the face speeds you up
 const WAVE_PUSH = 60;    // forward push from the wave, strongest in the "pocket"
 const DRAG = 0.35;       // water resistance (share of speed lost per second)
 const TURN_RATE = 2.0;   // how fast you carve (radians per second)
+const NOSE_DROP = 1.1;   // how fast the nose tips back down when you let go
+const TURN_RESPONSE = 12; // how quickly a carve builds up and eases off (higher = snappier)
+const CARVE_DRAG = 0.25; // speed lost while the rail is dug in (the "brake" into the corner)
+const LOAD_RATE = 1.4;   // how fast a carve loads you up (full load after ~0.7s)
+const DRIVE = 110;       // speed gained coming out of a fully loaded, well-angled turn
 const MAX_ANGLE = 1.2;   // steepest you can point up or down (~69 degrees)
 const MIN_SPEED = 30;
 const MAX_SPEED = 240;
-const CURL_SPEED = 75;   // how fast the breaking part of the wave chases you
+const CURL_SPEED = 95;   // how fast the breaking part of the wave chases you
+const LIP_THROW = 0.45;  // after a re-entry, seconds before you can carve again
+const LIP_STALL = 0.7;   // seconds you can hang at the lip before going over the falls
 const BARREL_LENGTH = 110; // how far the hollow tube reaches ahead of the curl
 
 // ---------- Colors (a small palette keeps it looking 16-bit) ----------
@@ -44,7 +51,8 @@ const HAIR = "#5a3a1a";
 
 // ---------- Game state ----------
 const keys = {};       // which keys are held down right now
-let surfer;            // { x, y, speed, angle }
+let surfer;            // { x, y, speed, angle, turn, load, drive, driveTimer, thrown, lipTime }
+let callout;           // { text, timer }: quick feedback on your last turn
 let curlX;             // world x of the breaking curl
 let cameraX;           // world x of the screen's left edge
 let spray;             // list of water-spray particles
@@ -54,10 +62,16 @@ let caughtTimer;       // > 0 while showing the wipeout message
 let caughtMessage;     // what got you
 let wasCarving;        // was space held last frame?
 let fanCooldown;       // stops spray fans firing every frame
+let shake;             // screen shake strength, in pixels
 let elapsed = 0;       // seconds since the game started (for animation)
 
 function reset() {
-  surfer = { x: 0, y: 100, speed: 110, angle: 0.3 };
+  surfer = {
+    x: 0, y: 100, speed: 110, angle: 0.3, turn: 0,
+    load: 0, drive: 0, driveTimer: 0, thrown: 0, lipTime: 0,
+  };
+  callout = { text: "", timer: 0 };
+  shake = 0;
   curlX = -140;
   cameraX = surfer.x - canvas.width / 2;
   spray = [];
@@ -165,6 +179,13 @@ function startAudio() {
   audio = { ac, rumbleGain, hissGain };
 }
 
+// Go quiet when you switch to another tab, and pick back up when you return
+document.addEventListener("visibilitychange", () => {
+  if (!audio) return;
+  if (document.hidden) audio.ac.suspend();
+  else if (!muted) audio.ac.resume();
+});
+
 function toggleMute() {
   if (!audio) return;
   muted = !muted;
@@ -196,9 +217,46 @@ function sprayFan(count) {
   }
 }
 
+// ---------- Turns ----------
+function say(text) {
+  callout = { text, timer: 0.9 };
+}
+
+// Called the moment you let go of a carve. How much drive you get out of
+// the turn depends on how loaded up you were and the angle you exit at.
+function exitTurn(depth) {
+  const load = surfer.load;
+  surfer.load = 0;
+  if (load < 0.25) return; // just a tap, not a real turn
+
+  if (depth < 0.35) {
+    // Letting go up near the lip: a top turn. Snap back down with spray.
+    if (surfer.speed > 70 && fanCooldown <= 0) {
+      sprayFan(18);
+      fanCooldown = 0.4;
+    }
+    surfer.drive = DRIVE * 0.5 * load;
+    surfer.driveTimer = 0.35;
+    return;
+  }
+
+  // A bottom turn. The best exit points steeply up the face (going vertical).
+  // Exit too flat and the turn was wasted: you scrub off speed.
+  const quality = clamp((-surfer.angle - 0.15) / 0.55, 0, 1); // 0 = flat, 1 = steep
+  if (quality > 0.3) {
+    surfer.drive = DRIVE * load * quality;
+    surfer.driveTimer = 0.35;
+    if (load * quality > 0.6) say("DRIVE!");
+  } else if (load > 0.5) {
+    surfer.speed *= 0.85;
+    say("SCRUBBED");
+  }
+}
+
 // ---------- Update: move everything a little ----------
 function update(dt) {
   elapsed += dt;
+  shake = Math.max(0, shake - 12 * dt);
 
   if (caughtTimer > 0) {
     caughtTimer -= dt;
@@ -207,14 +265,32 @@ function update(dt) {
     return;
   }
 
-  // 1. Steering: hold space to turn up the face, let go to turn down it.
-  //    Angle 0 = riding flat; negative = pointing up; positive = pointing down.
-  if (keys.Space) {
-    surfer.angle -= TURN_RATE * dt;
+  // 1. Steering. Angle 0 = riding flat; negative = pointing up; positive = down.
+  //    Holding space digs the rail in and carves you up the face.
+  //    Letting go releases the carve: you hold your line while gravity
+  //    slowly tips the nose back down. More speed = more grip = sharper carves.
+  //    Right after a re-entry the lip has thrown you down the face, so for
+  //    a moment holding space does nothing.
+  surfer.thrown -= dt;
+  const pressing = keys.Space && surfer.thrown <= 0;
+  const grip = clamp(surfer.speed / 120, 0.5, 1.3);
+  let targetTurn;
+  if (pressing) {
+    targetTurn = -TURN_RATE * grip;
   } else {
-    surfer.angle += TURN_RATE * dt;
+    targetTurn = NOSE_DROP * Math.cos(surfer.angle); // gentler once already pointing down
   }
+  // The board has weight: a turn builds up and eases off instead of snapping
+  surfer.turn += (targetTurn - surfer.turn) * Math.min(1, TURN_RESPONSE * dt);
+  surfer.angle += surfer.turn * dt;
   surfer.angle = clamp(surfer.angle, -MAX_ANGLE, MAX_ANGLE);
+
+  // The face curves out flat at the bottom, which levels you off smoothly
+  // (a natural bottom turn) instead of slamming you into the flats
+  const nearBottom = clamp((surfer.y - (BOTTOM_Y - 14)) / 14, 0, 1);
+  if (surfer.angle > 0) {
+    surfer.angle = Math.max(0, surfer.angle - nearBottom * 4 * dt);
+  }
 
   // 2. Speed. Downhill speeds you up and uphill slows you down,
   //    the wave pushes you along in the pocket, and drag always slows you.
@@ -224,31 +300,67 @@ function update(dt) {
   surfer.speed += GRAVITY * Math.sin(surfer.angle) * dt;
   surfer.speed += push * dt;
   surfer.speed -= DRAG * surfer.speed * dt;
+
+  // Slow in, fast out. Like driving a corner: carving brakes you a little
+  // but loads you up (think compressing through the turn), and letting go
+  // releases that energy as acceleration on the way out.
+  if (pressing) {
+    surfer.speed -= CARVE_DRAG * surfer.speed * dt;
+    surfer.load = Math.min(1, surfer.load + LOAD_RATE * dt);
+  }
+  if (wasCarving && !pressing) {
+    exitTurn(depth);
+  }
+  if (surfer.driveTimer > 0) {
+    surfer.speed += surfer.drive * dt / 0.35; // the boost is spread over 0.35s
+    surfer.driveTimer -= dt;
+  }
   surfer.speed = clamp(surfer.speed, MIN_SPEED, MAX_SPEED);
 
   // 3. Move in the direction the board is pointing
   surfer.x += Math.cos(surfer.angle) * surfer.speed * dt;
   surfer.y += Math.sin(surfer.angle) * surfer.speed * dt;
 
-  // 4. Stay on the wave face (flatten out at the top and bottom)
+  // 4. Stay on the wave face
   fanCooldown -= dt;
   if (surfer.y > BOTTOM_Y) {
+    // Down in the flats: no wave under you, so you bog down
     surfer.y = BOTTOM_Y;
     surfer.angle = Math.min(surfer.angle, 0);
+    surfer.speed -= surfer.speed * 0.5 * dt;
   }
   if (surfer.y < lip) {
-    // Smacking the lip with speed throws a big fan of spray
-    if (surfer.angle < -0.3 && surfer.speed > 90 && fanCooldown <= 0) {
-      sprayFan(25);
-      fanCooldown = 0.4;
-    }
     surfer.y = lip;
-    surfer.angle = Math.max(surfer.angle, 0);
+    if (surfer.angle < 0) {
+      // Re-entry: smack the lip and swing back down the face.
+      // Hit it vertical and the wave throws you back down with your speed;
+      // hit it at a shallow angle and it goes mushy.
+      const vertical = surfer.angle < -0.75;
+      if (vertical && surfer.speed > 90 && fanCooldown <= 0) {
+        sprayFan(30);
+        fanCooldown = 0.4;
+        shake = 2;
+        say("VERTICAL!");
+      } else if (!vertical) {
+        say("MUSHY");
+      }
+      surfer.angle = Math.max(0.4, -surfer.angle * 0.5);
+      surfer.turn = NOSE_DROP * 2;
+      surfer.thrown = LIP_THROW;
+      surfer.speed *= vertical ? 0.98 : 0.85;
+    }
+  }
+
+  // Hang around up at the lip for too long and it pulls you over the falls
+  if (depth < 0.1) {
+    surfer.lipTime += dt;
+  } else {
+    surfer.lipTime = Math.max(0, surfer.lipTime - 2 * dt);
   }
 
   // 5. Spray: a steady stream while carving, and a fan when you
   //    snap back down off the top of the wave (a "top turn")
-  const carving = keys.Space && surfer.speed > 80;
+  const carving = pressing && surfer.speed > 80;
   if (carving) {
     spray.push({
       x: surfer.x - 6,
@@ -260,11 +372,8 @@ function update(dt) {
       maxLife: 0.5,
     });
   }
-  if (wasCarving && !keys.Space && depth < 0.35 && surfer.speed > 70 && fanCooldown <= 0) {
-    sprayFan(18);
-    fanCooldown = 0.4;
-  }
-  wasCarving = keys.Space;
+  wasCarving = pressing;
+  callout.timer -= dt;
 
   for (const p of spray) {
     p.vy += 200 * dt; // gravity
@@ -299,9 +408,15 @@ function update(dt) {
   if (curlX > surfer.x - 4) {
     caughtTimer = 1.5;
     caughtMessage = "CAUGHT INSIDE!";
+    shake = 5;
   } else if (barrel && surfer.y < barrel.curtainBottom - 2) {
     caughtTimer = 1.5;
     caughtMessage = "HIT BY THE LIP!";
+    shake = 5;
+  } else if (surfer.lipTime > LIP_STALL) {
+    caughtTimer = 1.5;
+    caughtMessage = "OVER THE FALLS!";
+    shake = 5;
   }
 
   // 7. Camera: glide toward the spot that puts the surfer in the middle
@@ -317,6 +432,12 @@ function update(dt) {
 
 // ---------- Draw: paint the current state ----------
 function draw() {
+  // Screen shake: nudge everything by a random amount for a moment
+  ctx.save();
+  if (shake > 0) {
+    ctx.translate(Math.round((Math.random() - 0.5) * shake * 2), Math.round((Math.random() - 0.5) * shake * 2));
+  }
+
   drawSky();
   drawWave();
   drawShore();
@@ -333,6 +454,7 @@ function draw() {
   drawBarrelLip();
   drawWhitewater();
   drawSpray();
+  ctx.restore(); // the HUD doesn't shake
   drawHud();
 }
 
@@ -587,6 +709,8 @@ function drawHud() {
   drawText(muted ? "M: SOUND OFF" : "M: SOUND ON", 252, 20);
   if (caughtTimer > 0) {
     drawText(caughtMessage, 124, 40);
+  } else if (callout.timer > 0) {
+    drawText(callout.text, 160 - callout.text.length * 2.5, 40);
   }
 }
 
